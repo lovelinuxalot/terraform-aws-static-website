@@ -16,6 +16,11 @@ provider "aws" {
   region = var.region
 }
 
+provider "aws" {
+  alias = "us_east_1"
+  region = "us-east-1"
+}
+
 #------------------------------------------------------------------------------
 # DEFINING LOCAL VARIABLES TO USE WITH RESOURCES
 #------------------------------------------------------------------------------
@@ -66,6 +71,42 @@ data "aws_iam_policy_document" "static_bucket_policy" {
     ]
     resources = [
       "${aws_s3_bucket.static_bucket.arn}/*",
+    ]
+  }
+}
+#------------------------------------------------------------------------------
+# IAM POLICY TO ATTACH TO LAMBDA ROLE
+#------------------------------------------------------------------------------
+data "aws_iam_policy_document" "lambda_execution_role_policy" {
+  version = "2012-10-17"
+  policy_id = "LambdaExecutionRoleForCloudfront"
+  statement {
+    sid = "LambdaExecutionRoleForCloudfront"
+    effect = "Allow"
+    principals {
+      type = "Service"
+      identifiers = [
+        "lambda.amazonaws.com",
+        "edgelambda.amazonaws.com"
+      ]
+    }
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+data "aws_iam_policy_document" "lambda_execution_policy_for_logs" {
+  version = "2012-10-17"
+  policy_id = "LambdaExecutionRoleForCloudWatch"
+  statement {
+    sid = "AllowCloudWatchLogs"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents"
+    ]
+    resources = [
+      "arn:aws:logs:*:*:*"
     ]
   }
 }
@@ -213,6 +254,17 @@ resource "aws_cloudfront_distribution" "website_distribution" {
     compress               = true
     viewer_protocol_policy = "redirect-to-https"
 
+    lambda_function_association {
+      event_type = "origin-response"
+      lambda_arn = aws_lambda_function.rewrite_response_headers.qualified_arn
+      include_body = false
+    }
+    lambda_function_association {
+      event_type = "viewer-request"
+      lambda_arn = aws_lambda_function.basic_auth.qualified_arn
+      include_body = false
+    }
+
   }
 
   ordered_cache_behavior {
@@ -352,4 +404,69 @@ resource "aws_waf_web_acl" "waf_acl" {
 }
 
 
+#------------------------------------------------------------------------------
+# CREATE LAMBDA FUNCTION TO REWRITE RESPONSE HEADERS
+#------------------------------------------------------------------------------
+data "archive_file" "response_headers_zip" {
+  type        = "zip"
+  source_file = "${path.module}/src/lambda_scripts/rewrite_response.js"
+  output_path = "${local.tmp_path}/rewrite_response_headers.zip"
+}
+
+resource "aws_iam_role" "lambda_execution_role" {
+  name               = "${var.website_name}_lambda_execution_role"
+  assume_role_policy = data.aws_iam_policy_document.lambda_execution_role_policy.json
+  tags               = { for tag_name, tag_value in var.custom_tags : tag_name => tag_value }
+}
+
+resource "aws_lambda_function" "rewrite_response_headers" {
+  provider         = aws.us_east_1
+  filename         = data.archive_file.response_headers_zip.output_path
+  source_code_hash = data.archive_file.response_headers_zip.output_base64sha256
+  function_name    = "rewrite_response_headers"
+  handler          = "rewrite_response.handler"
+  role             = aws_iam_role.lambda_execution_role.arn
+  runtime          = "nodejs12.x"
+  publish          = true
+  tags             = { for tag_name, tag_value in var.custom_tags : tag_name => tag_value }
+  //  depends_on = [aws_iam_policy_attachment.lambda_policy_attachment]
+}
+
+resource "local_file" "basic_auth" {
+  filename = "${local.tmp_path}/basic_auth.js"
+  content = templatefile("${path.module}/src/lambda_scripts/basic_auth.tpl", {
+    user = var.user
+    pass = var.pass
+  })
+}
+
+data "archive_file" "basic_auth_zip" {
+  depends_on = [local_file.basic_auth]
+  type = "zip"
+  source_file = local_file.basic_auth.filename
+  output_path = "${local.tmp_path}/basic_auth.zip"
+}
+
+resource "aws_lambda_function" "basic_auth" {
+  provider         = aws.us_east_1
+  filename         = data.archive_file.basic_auth_zip.output_path
+  source_code_hash = data.archive_file.basic_auth_zip.output_base64sha256
+  function_name    = "basic_auth"
+  handler          = "basic_auth.handler"
+  role             = aws_iam_role.lambda_execution_role.arn
+  runtime          = "nodejs12.x"
+  publish          = true
+  tags             = { for tag_name, tag_value in var.custom_tags : tag_name => tag_value }
+  depends_on = [aws_iam_role.lambda_execution_role]
+}
+
+resource "aws_iam_policy" "lambda_execution_policy_for_logs" {
+  policy = data.aws_iam_policy_document.lambda_execution_policy_for_logs.json
+}
+
+resource "aws_iam_policy_attachment" "lambda_policy_attachment" {
+  name = "${var.website_name}_lambda_logs_policy"
+  policy_arn = aws_iam_policy.lambda_execution_policy_for_logs.arn
+  roles = [aws_iam_role.lambda_execution_role.name]
+}
 

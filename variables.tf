@@ -41,3 +41,6 @@ variable "forward_www_cname" {
   default     = false
   type        = bool
 }
+
+variable "user" {}
+variable "pass" {}
